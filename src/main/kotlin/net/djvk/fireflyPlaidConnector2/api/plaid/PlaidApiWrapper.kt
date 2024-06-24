@@ -1,11 +1,13 @@
 package net.djvk.fireflyPlaidConnector2.api.plaid
 
+import com.fasterxml.jackson.databind.SerializationFeature
 import io.ktor.client.HttpClientConfig
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.plugins.*
 import io.ktor.http.*
 import kotlinx.coroutines.delay
 import net.djvk.fireflyPlaidConnector2.api.plaid.apis.PlaidApi
+import net.djvk.fireflyPlaidConnector2.api.plaid.infrastructure.ApiClient
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
@@ -33,7 +35,10 @@ class PlaidApiWrapper(
     httpClientEngine: HttpClientEngine? = null,
     httpClientConfig: ((HttpClientConfig<*>) -> Unit)? = null,
 ) {
-    private val plaidApi = PlaidApi(baseUrl, httpClientEngine, httpClientConfig)
+    private val plaidApi = PlaidApi(baseUrl, httpClientEngine, httpClientConfig) {
+        ApiClient.JSON_DEFAULT.invoke(this)
+        configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+    }
     private val logger = LoggerFactory.getLogger(this::class.java)
 
     init {
