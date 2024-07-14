@@ -1,5 +1,6 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsGetResponse
 import net.djvk.fireflyPlaidConnector2.config.AccountConfig
@@ -29,6 +30,7 @@ internal class BatchSyncRunnerTest {
                 fireflyAboutApi = firefly.aboutApi,
                 fireflyTxApi = firefly.transactionsApi,
                 fireflyAccountsApi = firefly.accountsApi,
+                metrics = SyncMetrics(SimpleMeterRegistry())
             )
             val defaultTransactionConverter = TransactionConverter(
                 useNameForDestination = false,
