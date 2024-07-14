@@ -199,7 +199,7 @@ class BatchSyncRunner(
                 }
 
                 val earliestTimestamp = txs.fold(OffsetDateTime.now()) { acc, tx ->
-                    val ts = converter.getTxTimestamp(tx)
+                    val ts = converter.getTxPostedTimestamp(tx)
                     if (ts < acc) {
                         ts
                     } else {
