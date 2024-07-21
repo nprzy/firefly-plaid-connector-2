@@ -47,6 +47,7 @@ class PolledSyncRunner(
     private val syncHelper: SyncHelper,
 
     private val converter: TransactionConverter,
+    private val metrics: SyncMetrics,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -96,153 +97,13 @@ class PolledSyncRunner(
                  * Periodic polling loop
                  */
                 do {
-                    logger.debug("Polling loop start")
-                    val transferWindowStart = LocalDate.now().minusDays(existingFireflyPullWindowDays.toLong())
-
-                    /**
-                     * Get all Firefly transactions within [existingFireflyPullWindowDays] so that we can handle Plaid
-                     *  updates and deletes, as well as try to match up transfers.
-                     */
-                    val existingFireflyTxs = mutableListOf<TransactionRead>()
-
-                    var fireflyTxPage = 0
-                    do {
-                        logger.debug("Fetching page $fireflyTxPage of Firefly transactions with window starting at $transferWindowStart")
-                        val response = fireflyTxApi.listTransaction(
-                            fireflyTxPage++,
-                            transferWindowStart,
-                            LocalDate.now(),
-                            TransactionTypeFilter.all,
-                        ).body()
-                        val pagination = response.meta.pagination
-
-                        /**
-                         * Don't do any more filtering here, we will need all transactions for potentially matching
-                         *  up to update and delete requests.
-                         *
-                         * See [TransactionConverter.filterFireflyCandidateTransferTxs] for the filtering we do
-                         *  before trying to match up transfers.
-                         */
-                        val filteredTxs = response.data
-                        logger.debug("Fetched ${filteredTxs.size} existing Firefly single-split, non transfer transactions with window starting at $transferWindowStart")
-                        existingFireflyTxs.addAll(filteredTxs)
-                    } while (pagination != null &&
-                        pagination.currentPage < pagination.totalPages &&
-                        // This condition is a failsafe to avoid an infinite loop
-                        fireflyTxPage < fireflyPageCountMax
-                    )
-                    if (fireflyTxPage >= fireflyPageCountMax) {
-                        throw RuntimeException("Exceeded Firefly failsafe max page count $fireflyPageCountMax")
+                    val timeSample = metrics.startTimer()
+                    try {
+                        runOnce()
+                    } finally {
+                        timeSample.stop(metrics.pollRunnerExecTime)
+                        metrics.printMetrics()
                     }
-
-                    val plaidCreatedTxs = mutableListOf<PlaidTransaction>()
-                    val plaidUpdatedTxs = mutableListOf<PlaidTransaction>()
-                    val plaidDeletedTxs = mutableListOf<PlaidTransactionId>()
-
-                    accessTokenLoop@ for ((accessToken, accountIds) in accountAccessTokenSequence) {
-                        logger.debug(
-                            "Querying Plaid transaction sync endpoint for access token $accessToken " +
-                                    " and account ids ${accountIds.joinToString("; ")}"
-                        )
-                        val accountIdSet = accountIds.toSet()
-                        /**
-                         * Plaid transaction batch loop
-                         */
-                        do {
-                            /**
-                             * Iterate through batches of Plaid transactions
-                             *
-                             * In sync mode we fetch and retain all Plaid transactions that have changed since the last poll.
-                             */
-                            val response = executeTransactionSyncRequest(
-                                accessToken,
-                                cursorMap[accessToken],
-                                plaidBatchSize
-                            ) ?: continue@accessTokenLoop
-                            cursorMap[accessToken] = response.nextCursor
-                            logger.debug(
-                                "Received batch of sync updates for access token $accessToken: " +
-                                        "${response.added.size} created; ${response.modified.size} updated; " +
-                                        "${response.removed.size} deleted; next cursor ${response.nextCursor}"
-                            )
-
-                            /**
-                             * The transaction sync endpoint doesn't take accountId as a parameter, so do that filtering here
-                             */
-                            plaidCreatedTxs.addAll(response.added.filter { accountIdSet.contains(it.accountId) })
-                            plaidUpdatedTxs.addAll(response.modified.filter { accountIdSet.contains(it.accountId) })
-                            plaidDeletedTxs.addAll(response.removed.mapNotNull { it.transactionId })
-
-                            // Keep going until we get all the transactions
-                        } while (response.hasMore)
-                    }
-                    /**
-                     * Don't write the cursor map here, wait until after we've successfully committed the transactions
-                     *  to Firefly so that we retry if something goes wrong with the Firefly insert
-                     */
-
-                    // Map Plaid transactions to Firefly transactions
-                    logger.trace("Converting Plaid transactions to Firefly transactions")
-                    // TODO: do we need to dedupe the create/update/delete events and keep only the latest event?
-                    //  Or has Plaid already done that for us?
-                    val convertResult = converter.convertPollSync(
-                        accountMap,
-                        plaidCreatedTxs,
-                        plaidUpdatedTxs,
-                        plaidDeletedTxs,
-                        existingFireflyTxs,
-                    )
-                    logger.debug(
-                        "Conversion result: ${convertResult.creates.size} creates; " +
-                                "${convertResult.updates.size} updates; " +
-                                "${convertResult.deletes.size} deletes;"
-                    )
-
-                    // Insert into Firefly
-                    syncHelper.optimisticInsertBatchIntoFirefly(convertResult.creates)
-                    for (update in convertResult.updates) {
-                        /**
-                         * Firefly's transaction update endpoint does not allow changing transaction types
-                         *  (i.e. deposit to transfer), so we have to resolve updates as deletes and creates.
-                         * I'm not crazy about this because any other reference to the existing record will be
-                         *  broken, but such is life.
-                         */
-
-                        update.id ?: throw IllegalArgumentException("Unexpected update tx missing id: $update")
-                        /**
-                         * Delete first, if that fails, don't do the create.
-                         */
-                        try {
-                            syncHelper.deleteBatchInFirefly(listOf(update.id))
-                        } catch (e: Exception) {
-                            logger.error(
-                                "Failed to execute delete as first part of updating transaction ${update.id}; " +
-                                        "aborting create part of update operation", e
-                            )
-                            continue
-                        }
-                        /**
-                         * This should not be a duplicate, so allow an exception to propagate if it is
-                         */
-                        syncHelper.pessimisticInsertBatchIntoFirefly(listOf(update))
-                    }
-                    syncHelper.deleteBatchInFirefly(convertResult.deletes)
-
-                    /**
-                     * Now that we've committed the changes to Firefly, update the cursor map
-                     */
-                    writeCursorMap(cursorMap)
-
-                    /**
-                     * Trigger GC to try to reduce heap size (depends on VM configuration)
-                     *
-                     * The application sits idle for the vast majority of its executing time in polling mode, so here
-                     *  we try to trigger the GC before sleeping to hopefully reclaim some heap.
-                     * This depends a lot on the VM and GC configuration.
-                     * TODO: do some GC tests and give some guidance here.
-                     */
-                    logger.trace("Calling System.gc()")
-                    System.gc()
 
                     // Sleep until next poll
                     logger.info("Sleeping $syncFrequencyMinutes")
@@ -250,6 +111,164 @@ class PolledSyncRunner(
                 } while (!terminated.get())
             }
         }
+    }
+
+    suspend fun runOnce() {
+        logger.debug("Polling loop start")
+        val cursorMap = readCursorMap()
+        val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
+        val transferWindowStart = LocalDate.now().minusDays(existingFireflyPullWindowDays.toLong())
+
+        /**
+         * Get all Firefly transactions within [existingFireflyPullWindowDays] so that we can handle Plaid
+         *  updates and deletes, as well as try to match up transfers.
+         */
+        val existingFireflyTxs = mutableListOf<TransactionRead>()
+
+        var fireflyTxPage = 0
+        do {
+            logger.debug("Fetching page $fireflyTxPage of Firefly transactions with window starting at $transferWindowStart")
+            val response = metrics.measureRequest(SyncMetrics.RequestType.FIREFLY_TX_LIST) {
+                fireflyTxApi.listTransaction(
+                    fireflyTxPage++,
+                    transferWindowStart,
+                    LocalDate.now(),
+                    TransactionTypeFilter.all,
+                )
+            }.body()
+            val pagination = response.meta.pagination
+
+            /**
+             * Don't do any more filtering here, we will need all transactions for potentially matching
+             *  up to update and delete requests.
+             *
+             * See [TransactionConverter.filterFireflyCandidateTransferTxs] for the filtering we do
+             *  before trying to match up transfers.
+             */
+            val filteredTxs = response.data
+            logger.debug("Fetched ${filteredTxs.size} existing Firefly single-split, non transfer transactions with window starting at $transferWindowStart")
+            existingFireflyTxs.addAll(filteredTxs)
+        } while (pagination != null &&
+            pagination.currentPage < pagination.totalPages &&
+            // This condition is a failsafe to avoid an infinite loop
+            fireflyTxPage < fireflyPageCountMax
+        )
+        if (fireflyTxPage >= fireflyPageCountMax) {
+            throw RuntimeException("Exceeded Firefly failsafe max page count $fireflyPageCountMax")
+        }
+
+        val plaidCreatedTxs = mutableListOf<PlaidTransaction>()
+        val plaidUpdatedTxs = mutableListOf<PlaidTransaction>()
+        val plaidDeletedTxs = mutableListOf<PlaidTransactionId>()
+
+        accessTokenLoop@ for ((accessToken, accountIds) in accountAccessTokenSequence) {
+            logger.debug(
+                "Querying Plaid transaction sync endpoint for access token $accessToken " +
+                        " and account ids ${accountIds.joinToString("; ")}"
+            )
+            val accountIdSet = accountIds.toSet()
+            /**
+             * Plaid transaction batch loop
+             */
+            do {
+                /**
+                 * Iterate through batches of Plaid transactions
+                 *
+                 * In sync mode we fetch and retain all Plaid transactions that have changed since the last poll.
+                 */
+                val response = executeTransactionSyncRequest(
+                    accessToken,
+                    cursorMap[accessToken],
+                    plaidBatchSize
+                ) ?: continue@accessTokenLoop
+                cursorMap[accessToken] = response.nextCursor
+                logger.debug(
+                    "Received batch of sync updates for access token $accessToken: " +
+                            "${response.added.size} created; ${response.modified.size} updated; " +
+                            "${response.removed.size} deleted; next cursor ${response.nextCursor}"
+                )
+
+                /**
+                 * The transaction sync endpoint doesn't take accountId as a parameter, so do that filtering here
+                 */
+                plaidCreatedTxs.addAll(response.added.filter { accountIdSet.contains(it.accountId) })
+                plaidUpdatedTxs.addAll(response.modified.filter { accountIdSet.contains(it.accountId) })
+                plaidDeletedTxs.addAll(response.removed.mapNotNull { it.transactionId })
+
+                // Keep going until we get all the transactions
+            } while (response.hasMore)
+        }
+        /**
+         * Don't write the cursor map here, wait until after we've successfully committed the transactions
+         *  to Firefly so that we retry if something goes wrong with the Firefly insert
+         */
+
+        metrics.plaidSyncCreated.record(plaidCreatedTxs.size.toDouble())
+        metrics.plaidSyncUpdated.record(plaidUpdatedTxs.size.toDouble())
+        metrics.plaidSyncDeleted.record(plaidDeletedTxs.size.toDouble())
+
+        // Map Plaid transactions to Firefly transactions
+        logger.trace("Converting Plaid transactions to Firefly transactions")
+        // TODO: do we need to dedupe the create/update/delete events and keep only the latest event?
+        //  Or has Plaid already done that for us?
+        val convertResult = converter.convertPollSync(
+            accountMap,
+            plaidCreatedTxs,
+            plaidUpdatedTxs,
+            plaidDeletedTxs,
+            existingFireflyTxs,
+        )
+        logger.debug(
+            "Conversion result: ${convertResult.creates.size} creates; " +
+                    "${convertResult.updates.size} updates; " +
+                    "${convertResult.deletes.size} deletes;"
+        )
+
+        // Insert into Firefly
+        syncHelper.optimisticInsertBatchIntoFirefly(convertResult.creates)
+        for (update in convertResult.updates) {
+            /**
+             * Firefly's transaction update endpoint does not allow changing transaction types
+             *  (i.e. deposit to transfer), so we have to resolve updates as deletes and creates.
+             * I'm not crazy about this because any other reference to the existing record will be
+             *  broken, but such is life.
+             */
+
+            update.id ?: throw IllegalArgumentException("Unexpected update tx missing id: $update")
+            /**
+             * Delete first, if that fails, don't do the create.
+             */
+            try {
+                syncHelper.deleteBatchInFirefly(listOf(update.id))
+            } catch (e: Exception) {
+                logger.error(
+                    "Failed to execute delete as first part of updating transaction ${update.id}; " +
+                            "aborting create part of update operation", e
+                )
+                continue
+            }
+            /**
+             * This should not be a duplicate, so allow an exception to propagate if it is
+             */
+            syncHelper.pessimisticInsertBatchIntoFirefly(listOf(update))
+        }
+        syncHelper.deleteBatchInFirefly(convertResult.deletes)
+
+        /**
+         * Now that we've committed the changes to Firefly, update the cursor map
+         */
+        writeCursorMap(cursorMap)
+
+        /**
+         * Trigger GC to try to reduce heap size (depends on VM configuration)
+         *
+         * The application sits idle for the vast majority of its executing time in polling mode, so here
+         *  we try to trigger the GC before sleeping to hopefully reclaim some heap.
+         * This depends a lot on the VM and GC configuration.
+         * TODO: do some GC tests and give some guidance here.
+         */
+        logger.trace("Calling System.gc()")
+        System.gc()
     }
 
 
@@ -321,7 +340,9 @@ class PolledSyncRunner(
         val request = getTransactionSyncRequest(accessToken, cursor, plaidBatchSize)
         try {
             return plaidApiWrapper.executeRequest(
-                { plaidApi -> plaidApi.transactionsSync(request) },
+                { plaidApi ->
+                    metrics.measureRequest(SyncMetrics.RequestType.PLAID_TX_SYNC) { plaidApi.transactionsSync(request) }
+                },
                 "transaction sync request"
             ).body()
         } catch (cre: ClientRequestException) {

@@ -31,6 +31,7 @@ class SyncHelper(
     private val fireflyAboutApi: AboutApi,
     private val fireflyTxApi: TransactionsApi,
     private val fireflyAccountsApi: AccountsApi,
+    private val metrics: SyncMetrics,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -122,16 +123,20 @@ class SyncHelper(
             logger.info("Skipped transaction ${fireflyTx.tx.externalId} with amount 0.0")
             return
         }
-        fireflyTxApi.storeTransaction(fireflyTx.toTransactionStore())
+        metrics.measureRequest(SyncMetrics.RequestType.FIREFLY_TX_STORE) {
+            fireflyTxApi.storeTransaction(fireflyTx.toTransactionStore())
+        }
     }
 
     suspend fun updateBatchInFirefly(fireflyTxs: List<FireflyTransactionDto>) {
         for (fireflyTx in fireflyTxs) {
-            fireflyTxApi.updateTransaction(
-                fireflyTx.id
-                    ?: throw IllegalArgumentException("Can't update Firefly transaction without id: $fireflyTx"),
-                fireflyTx.toTransactionUpdate(),
-            )
+            metrics.measureRequest(SyncMetrics.RequestType.FIREFLY_TX_UPDATE) {
+                fireflyTxApi.updateTransaction(
+                    fireflyTx.id
+                        ?: throw IllegalArgumentException("Can't update Firefly transaction without id: $fireflyTx"),
+                    fireflyTx.toTransactionUpdate(),
+                )
+            }
         }
     }
 
@@ -140,7 +145,9 @@ class SyncHelper(
             logger.debug("Delete batch of ${fireflyTxIds.size} txs in Firefly")
         }
         for (fireflyTxId in fireflyTxIds) {
-            fireflyTxApi.deleteTransaction(fireflyTxId)
+            metrics.measureRequest(SyncMetrics.RequestType.FIREFLY_TX_DELETE) {
+                fireflyTxApi.deleteTransaction(fireflyTxId)
+            }
         }
     }
 }
