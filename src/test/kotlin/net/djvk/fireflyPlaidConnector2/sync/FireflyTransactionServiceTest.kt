@@ -67,22 +67,25 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
-    fun testProcessFireflyTransactionUpdatesHandlesDeleteFailure() {
+    fun testProcessFireflyTransactionUpdatesPropagatesDeleteFailure() {
         runBlocking {
             // Setup a transfer update
             val transferTransaction = FireflyFixtures.getTransaction(type = TransactionTypeProperty.transfer)
             val transferTxSplit = transferTransaction.transactions.first()
             val transferUpdate = FireflyTransactionDto("transfer-update-id", transferTxSplit)
 
-            // Mock delete to throw exception
+            // Mock delete to throw exception (simulating retries already exhausted internally)
             whenever(syncHelper.deleteBatchInFirefly(eq(listOf("transfer-update-id")))).thenThrow(RuntimeException("Delete failed"))
 
-            // Execute
-            fireflyTransactionService.processFireflyTransactionUpdates(
-                emptyList(),
-                listOf(transferUpdate),
-                emptyList()
-            )
+            // Execute - the failure must propagate rather than being silently swallowed, since
+            //  silently continuing would abandon the paired create and drop the transaction.
+            org.junit.jupiter.api.assertThrows<RuntimeException> {
+                fireflyTransactionService.processFireflyTransactionUpdates(
+                    emptyList(),
+                    listOf(transferUpdate),
+                    emptyList()
+                )
+            }
 
             // Verify
             verify(syncHelper).deleteBatchInFirefly(eq(listOf("transfer-update-id")))

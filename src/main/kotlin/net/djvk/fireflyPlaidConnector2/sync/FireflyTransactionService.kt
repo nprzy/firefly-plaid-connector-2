@@ -98,23 +98,17 @@ class FireflyTransactionService(
      *  transfer transactions, we have to resolve the updates as deletes and creates.
      * I'm not crazy about this because any other reference to the existing record will be
      *  broken, but such is life (and this behavior has been around for a while at this point).
+     *
+     * Delete and create are not wrapped in a try/catch here: [SyncHelper.deleteBatchInFirefly]
+     *  and [SyncHelper.pessimisticInsertBatchIntoFirefly] already retry transient failures
+     *  internally, so if either still throws here, retries are exhausted and the failure must
+     *  propagate rather than silently abandoning the paired create/delete.
      */
     private suspend fun processFireflyTransferUpdates(updates: List<FireflyTransactionDto>) {
         for (update in updates) {
             update.id ?: throw IllegalArgumentException("Unexpected transfer update tx missing id: $update")
 
-            /**
-             * Delete first, if that fails, don't do the create.
-             */
-            try {
-                syncHelper.deleteBatchInFirefly(listOf(update.id))
-            } catch (e: Exception) {
-                logger.error(
-                    "Failed to execute delete as first part of updating transaction ${update.id}; " +
-                            "aborting create part of update operation", e
-                )
-                continue
-            }
+            syncHelper.deleteBatchInFirefly(listOf(update.id))
 
             /**
              * This should not be a duplicate, so allow an exception to propagate if it is
